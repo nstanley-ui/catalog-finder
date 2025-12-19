@@ -24,27 +24,33 @@ def clean_url(url):
 
 # --- DISCOVERY MODULES ---
 
-def strategy_shopify(domain):
+def strategy_sitemap(domain):
     """
-    Strategy 1: The Shopify 'Backdoor'
-    Many midmarket brands (Gymshark, Allbirds, etc.) expose a JSON feed.
+    Strategy 2 (Updated): Sitemap Scanning for B2B & B2C
     """
     try:
-        url = f"{domain}/products.json?limit=250"
-        r = requests.get(url, headers=HEADERS, timeout=5)
+        sitemap_url = f"{domain}/sitemap.xml"
+        r = requests.get(sitemap_url, headers=HEADERS, timeout=5)
+        
         if r.status_code == 200:
-            data = r.json()
-            if 'products' in data and len(data['products']) > 0:
-                products = []
-                for p in data['products']:
-                    variant_price = p['variants'][0].get('price') if p.get('variants') else 'N/A'
-                    products.append({
-                        "Name": p.get('title'),
-                        "Price": variant_price,
-                        "URL": f"{domain}/products/{p.get('handle')}",
-                        "Method": "Shopify API (High Confidence)"
-                    })
-                return products
+            soup = BeautifulSoup(r.content, 'xml')
+            locs = soup.find_all('loc')
+            
+            # BROADER KEYWORDS: Added 'solution', 'platform', 'service'
+            keywords = ['/product', '/item', '/p/', '/solution', '/platform', '/service']
+            
+            product_urls = []
+            for u in locs:
+                url_text = u.text
+                if any(k in url_text for k in keywords):
+                    product_urls.append(url_text)
+            
+            return [{
+                "Name": "Detected Page",
+                "Price": "Request Demo", # B2B usually doesn't have public pricing
+                "URL": url,
+                "Method": "Sitemap Scan (Broad)"
+            } for url in product_urls[:20]]
     except Exception:
         pass
     return []
