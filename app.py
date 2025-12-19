@@ -2,7 +2,7 @@ import streamlit as st
 import requests
 from bs4 import BeautifulSoup
 import pandas as pd
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 
 # --- CONFIGURATION ---
 st.set_page_config(page_title="B2B Schema Discoverer", page_icon="🧩", layout="wide")
@@ -13,61 +13,87 @@ HEADERS = {
     'Accept-Language': 'en-US,en;q=0.9',
 }
 
-# --- 1. TARGET SCHEMAS (Based on your Analysis) ---
-TARGET_PATTERNS = {
+# --- 1. SCHEMA DEFINITIONS ---
+# Standard Directories (Demandbase / 6sense)
+DIRECTORY_PATTERNS = {
     '/products/': 'Product Suite',
     '/product/': 'Product Suite',
-    '/software/': 'Product Suite (Software)',
-    '/platform/': 'Unified Platform',
-    '/features/': 'Feature / Module',
-    '/solutions/': 'Solution (Job-to-be-Done)',
-    '/solution/': 'Solution (Job-to-be-Done)',
-    '/modules/': 'Platform Module'
+    '/platform/': 'Platform Feature',       # 6sense Style
+    '/solutions/': 'Solution (Use Case)',   # Demandbase Style
+    '/features/': 'Platform Feature',
+    '/software/': 'Product Suite',
+    '/capabilities/': 'Platform Feature'
 }
 
-# --- 2. NOISE FILTERING ---
-BLACKLIST_KEYWORDS = [
-    'career', 'job', 'hiring', 'apply',       # HR
-    'policy', 'privacy', 'terms', 'legal',    # Legal
-    'blog', 'news', 'press', 'release',       # Content
-    'login', 'signin', 'register', 'account', # Auth
-    'about', 'contact', 'investor', 'faq',    # Info
-    'support', 'help', 'docs', 'developers',  # Support
-    'customer-stories', 'case-studies'        # Marketing Content
+# --- 2. FLAT SCHEMA KEYWORDS (StackAdapt Style) ---
+# If a URL is at the root (domain.com/xyz), it MUST contain one of these to be accepted.
+# This prevents grabbing /about, /legal, /contact.
+FLAT_SCHEMA_KEYWORDS = [
+    'advertising', 'marketing', 'intelligence', 'sales', 'revenue',
+    'programmatic', 'dsp', 'campaign', 'channel', 'inventory',
+    'native', 'display', 'video', 'audio', 'connected-tv', 'ctv',
+    'abm', 'b2b', 'data', 'cloud', 'engine', 'studio'
 ]
 
-def is_valid_url(url):
-    """Checks if URL matches a Target Pattern and is not Blacklisted"""
-    url_lower = url.lower()
-    
-    # Must match at least one Target Pattern
-    if not any(pattern in url_lower for pattern in TARGET_PATTERNS.keys()):
-        return False
-        
-    # Must NOT match any Blacklist word
-    for bad_word in BLACKLIST_KEYWORDS:
-        if bad_word in url_lower:
-            return False
-            
-    return True
+# --- 3. NOISE FILTERING ---
+BLACKLIST_KEYWORDS = [
+    'career', 'job', 'hiring', 'apply', 'team', 'people',       # HR
+    'policy', 'privacy', 'terms', 'legal', 'gdpr', 'security',  # Legal
+    'blog', 'news', 'press', 'release', 'media', 'events',      # Content
+    'login', 'signin', 'register', 'account', 'portal',         # Auth
+    'about', 'contact', 'investor', 'faq', 'support', 'help',   # Info
+    'customer', 'case-study', 'resource', 'ebook', 'webinar'    # Marketing Content
+]
 
 def clean_link(url):
-    """Removes query params (?utm=...) and trailing slashes for deduplication"""
+    """Removes query params and trailing slashes"""
     if not url: return ""
     return url.split('?')[0].split('#')[0].rstrip('/')
 
-def classify_schema(url):
-    """Maps a URL to its Schema Type (Suite, Platform, or Solution)"""
-    url_lower = url.lower()
-    for pattern, schema_name in TARGET_PATTERNS.items():
-        if pattern in url_lower:
+def is_root_url(domain, url):
+    """Checks if a URL is strictly at the root level (domain.com/slug)"""
+    # Remove protocol and domain to get path
+    path = url.replace(domain, '').strip('/')
+    return '/' not in path and path != ''
+
+def classify_schema(url, domain):
+    """Maps URL to Schema Type: Directory vs. Flat"""
+    
+    # 1. Check Directory Patterns (Priority)
+    for pattern, schema_name in DIRECTORY_PATTERNS.items():
+        if pattern in url.lower():
             return schema_name
-    return "Other"
+            
+    # 2. Check Flat Schema (Root Level)
+    if is_root_url(domain, url):
+        return "Flat / Root (High Volume)"
+        
+    return "Other Product Page"
+
+def is_valid_candidate(url, domain):
+    """Decides if a URL is worth keeping"""
+    url_lower = url.lower()
+    
+    # 1. HARD EXCLUSION (Blacklist)
+    if any(bad in url_lower for bad in BLACKLIST_KEYWORDS):
+        return False
+        
+    # 2. DIRECTORY CHECK (Easy Yes)
+    if any(pattern in url_lower for pattern in DIRECTORY_PATTERNS.keys()):
+        return True
+        
+    # 3. FLAT SCHEMA CHECK (Hard Yes - Requires Keywords)
+    # If it is a root URL, it MUST have a business keyword
+    if is_root_url(domain, url):
+        if any(kw in url_lower for kw in FLAT_SCHEMA_KEYWORDS):
+            return True
+            
+    return False
 
 # --- STRATEGIES ---
 
 def strategy_shopify(domain):
-    """Check for hidden Shopify JSON feed (Retail/Midmarket)"""
+    """Retail Check (Hidden JSON)"""
     try:
         url = f"{domain}/products.json?limit=250"
         r = requests.get(url, headers=HEADERS, timeout=3)
@@ -83,41 +109,14 @@ def strategy_shopify(domain):
     except: pass
     return []
 
-def strategy_nav_scan(domain):
-    """Scans Homepage Navigation for Schema Patterns"""
-    try:
-        r = requests.get(domain, headers=HEADERS, timeout=8)
-        soup = BeautifulSoup(r.text, 'html.parser')
-        found_items = {}
-        
-        # Scan all links
-        for a in soup.find_all('a', href=True):
-            href = a.get('href')
-            full_url = urljoin(domain, href)
-            full_url = clean_link(full_url) # Clean it immediately
-            
-            if domain not in full_url: continue
-            if not is_valid_url(full_url): continue
-            
-            # Extract Title
-            title = a.get_text(strip=True)
-            if not title or len(title) > 60: 
-                # Fallback: Extract from URL slug
-                title = full_url.split('/')[-1].replace('-', ' ').title()
-                
-            if full_url not in found_items:
-                found_items[full_url] = {
-                    "Name": title,
-                    "Schema": classify_schema(full_url),
-                    "URL": full_url,
-                    "Source": "Homepage Scan"
-                }
-        return list(found_items.values())[:40]
-    except: pass
-    return []
-
-def strategy_sitemap(domain):
-    """Scans Sitemaps for Schema Patterns"""
+def strategy_universal_scan(domain):
+    """
+    Combines Nav Scan and Sitemap Scan into one powerful pass.
+    Handles 'Flat Schema' by checking root URLs against B2B keywords.
+    """
+    found_items = {}
+    
+    # 1. Scan Sitemap (Best for Demandbase/6sense)
     try:
         sitemaps = [f"{domain}/sitemap.xml", f"{domain}/sitemap_index.xml", f"{domain}/wp-sitemap.xml"]
         for sm_url in sitemaps:
@@ -126,36 +125,65 @@ def strategy_sitemap(domain):
                 if r.status_code == 200:
                     soup = BeautifulSoup(r.content, 'xml')
                     urls = [u.text for u in soup.find_all('loc')]
-                    
-                    found = []
                     for u in urls:
                         u = clean_link(u)
-                        if is_valid_url(u):
-                            found.append({
-                                "Name": u.split('/')[-1].replace('-', ' ').title(),
-                                "Schema": classify_schema(u),
+                        if is_valid_candidate(u, domain):
+                            title = u.split('/')[-1].replace('-', ' ').title()
+                            found_items[u] = {
+                                "Name": title,
+                                "Schema": classify_schema(u, domain),
                                 "URL": u,
-                                "Source": "Sitemap Scan"
-                            })
-                    if found: return found[:50]
+                                "Source": "Sitemap"
+                            }
+                    if found_items: break # Stop if we found a working sitemap
             except: continue
     except: pass
-    return []
+
+    # 2. Scan Homepage Nav (Best for StackAdapt/Flat links hidden from sitemap)
+    try:
+        r = requests.get(domain, headers=HEADERS, timeout=8)
+        soup = BeautifulSoup(r.text, 'html.parser')
+        for a in soup.find_all('a', href=True):
+            href = a.get('href')
+            full_url = urljoin(domain, href)
+            full_url = clean_link(full_url)
+            
+            if domain not in full_url: continue
+            
+            if is_valid_candidate(full_url, domain):
+                # Only add if not already found in sitemap
+                if full_url not in found_items:
+                    title = a.get_text(strip=True)
+                    if not title or len(title) > 50:
+                        title = full_url.split('/')[-1].replace('-', ' ').title()
+                    
+                    found_items[full_url] = {
+                        "Name": title,
+                        "Schema": classify_schema(full_url, domain),
+                        "URL": full_url,
+                        "Source": "Homepage Nav"
+                    }
+    except: pass
+    
+    return list(found_items.values())[:60]
 
 # --- UI LOGIC ---
 
 st.title("🧩 B2B Schema Discoverer")
 st.markdown("""
-Identify a company's architecture: **Product Suite**, **Unified Platform**, or **Solution-First**.
+Analyzes structure:
+1. **Solution-Based** (`/solutions/` - e.g. Demandbase)
+2. **Platform-Based** (`/platform/` - e.g. 6sense)
+3. **Flat / Root** (`/native-advertising` - e.g. StackAdapt)
 """)
 
 col1, col2 = st.columns([3, 1])
 with col1:
-    domain_input = st.text_input("Company Domain", placeholder="e.g. atlassian.com, gong.io, hubspot.com")
+    domain_input = st.text_input("Company Domain", placeholder="e.g. stackadapt.com")
 with col2:
     st.write("") 
     st.write("") 
-    run_btn = st.button("🔍 Analyze Domain", type="primary", use_container_width=True)
+    run_btn = st.button("🔍 Identify Schema", type="primary", use_container_width=True)
 
 if run_btn and domain_input:
     domain = domain_input.strip()
@@ -164,69 +192,52 @@ if run_btn and domain_input:
     
     st.divider()
     
-    with st.status(f"Scanning {domain} for schemas...", expanded=True) as status:
+    with st.status(f"Scanning {domain}...", expanded=True) as status:
         results = []
         
-        # 1. Quick API Check
+        # 1. Retail API
         api_results = strategy_shopify(domain)
-        if api_results:
-            results.extend(api_results)
-            st.write("✅ Found Retail/Shopify structure.")
+        if api_results: results.extend(api_results)
         
-        # 2. Homepage Scan (High fidelity for navigation structure)
+        # 2. Universal Scan (Sitemap + Flat Heuristics)
         if not results:
-            st.write("scanning homepage navigation...")
-            nav_results = strategy_nav_scan(domain)
-            results.extend(nav_results)
+            scan_results = strategy_universal_scan(domain)
+            results.extend(scan_results)
             
-        # 3. Sitemap Scan (Deep dive)
-        if len(results) < 5:
-            st.write("Deep scanning sitemaps...")
-            map_results = strategy_sitemap(domain)
-            # Merge without duplicates
-            existing_urls = {r['URL'] for r in results}
-            for item in map_results:
-                if item['URL'] not in existing_urls:
-                    results.append(item)
-                    
         if results:
             status.update(label="Analysis Complete", state="complete", expanded=False)
         else:
-            status.update(label="No structured catalog found", state="error", expanded=False)
+            status.update(label="No Data Found", state="error", expanded=False)
 
     if results:
         df = pd.DataFrame(results)
         
-        # --- SCHEMA DETECTION LOGIC ---
-        # Count the types of schemas found to guess the company strategy
+        # --- INTELLIGENT SCHEMA DIAGNOSIS ---
         schema_counts = df['Schema'].value_counts()
-        dominant_schema = schema_counts.idxmax()
+        top_schema = schema_counts.idxmax()
         
-        st.subheader(f"Strategy Detected: {dominant_schema}")
+        st.subheader(f"Detected Strategy: {top_schema}")
         
-        if "Platform" in dominant_schema:
-            st.info(f"💡 **Unified Platform:** This company positions its offering as a single system with multiple capabilities ({len(df)} modules found).")
-        elif "Solution" in dominant_schema:
-            st.info(f"💡 **Solution-Led:** This company sells based on 'Jobs to be Done' rather than tool names.")
-        elif "Suite" in dominant_schema or "Software" in dominant_schema:
-            st.info(f"💡 **Product Suite:** This company acts as a directory of distinct, standalone tools.")
+        if "Solution" in top_schema:
+            st.success("✅ **Outcome-Focused:** This site sells 'Solutions' (Jobs-to-be-Done) rather than just tools.")
+        elif "Platform" in top_schema:
+            st.info("✅ **Platform-Focused:** This site sells a unified engine with features nested as modules.")
+        elif "Flat" in top_schema:
+            st.warning("✅ **Traffic-Focused (Flat):** This site places products at the root level to capture high-intent SEO traffic (e.g., 'Native Advertising').")
         
-        # Display Data
         st.dataframe(
             df,
             column_config={
                 "URL": st.column_config.LinkColumn("Link"),
-                "Schema": st.column_config.TextColumn("Schema Type", help="How the URL is structured"),
+                "Schema": st.column_config.TextColumn("Schema Type"),
             },
             use_container_width=True,
             hide_index=True
         )
         
-        # Download
         clean_name = domain_input.replace('.', '_')
         csv = df.to_csv(index=False).encode('utf-8')
-        st.download_button("⬇️ Download Catalog CSV", csv, f"{clean_name}_catalog.csv", "text/csv")
-
+        st.download_button("⬇️ Download Catalog CSV", csv, f"{clean_name}_schema.csv", "text/csv")
     else:
-        st.warning("No catalog data found matching standard schemas.")
-        st.markdown("**Try checking:** Is the site a Single Page App (React)? Or does it use a non-standard URL structure?")
+        st.error("No structure found.")
+        st.markdown("If this is a **StackAdapt-style** site, ensure the links contain keywords like 'advertising' or 'channel'.")
